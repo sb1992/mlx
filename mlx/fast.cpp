@@ -618,7 +618,170 @@ array scaled_dot_product_attention(
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
+    const std::optional<array>& cu_seqlens_q /* = {} */,
+    const std::optional<array>& cu_seqlens_k /* = {} */,
     StreamOrDevice s /* = {}*/) {
+  // Variable-length path
+  if (cu_seqlens_q.has_value()) {
+    if (!cu_seqlens_k.has_value()) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] cu_seqlens_k is required when "
+          "cu_seqlens_q is provided.");
+    }
+    for (const auto& tensor : {queries, keys, values}) {
+      if (tensor.ndim() != 3) {
+        std::ostringstream msg;
+        msg << "[scaled_dot_product_attention] varlen input with shape "
+            << tensor.shape() << " expected to be rank 3 (total_tokens, H, D)";
+        throw std::invalid_argument(msg.str());
+      }
+    }
+    auto& csq = *cu_seqlens_q;
+    auto& csk = *cu_seqlens_k;
+    if (csq.ndim() != 1 || csk.ndim() != 1) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] cu_seqlens must be 1D.");
+    }
+    if (csq.dtype() != int32 || csk.dtype() != int32) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] cu_seqlens must be int32.");
+    }
+    if (csq.shape(0) != csk.shape(0)) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] cu_seqlens_q and cu_seqlens_k must "
+          "have the same number of elements.");
+    }
+    if (csq.shape(0) < 2) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] cu_seqlens must have at least 2 "
+          "elements.");
+    }
+    if (mask_arr.has_value()) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] Array mask not supported with "
+          "cu_seqlens.");
+    }
+    if (sinks.has_value()) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] Sinks not supported with "
+          "cu_seqlens.");
+    }
+
+    // Q, K must have matching last dims
+    if (queries.shape(-1) != keys.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] query, keys expected to have "
+             "matching last dimension; found query shape "
+          << queries.shape() << " for keys shape " << keys.shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+
+    // K, V must have matching number of heads
+    auto n_q_heads = queries.shape(1);
+    auto n_kv_heads = keys.shape(1);
+    if (keys.shape(1) != values.shape(1)) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] keys, values expected to have "
+             "matching n_kv_heads; found keys with n_heads "
+          << keys.shape(1) << " for values with n_heads " << values.shape(1)
+          << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (n_q_heads % n_kv_heads != 0) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] n_heads must be a multiple of "
+             "n_kv_heads, found n_heads "
+          << n_q_heads << " for n_kv_heads " << n_kv_heads << ".";
+      throw std::invalid_argument(msg.str());
+    }
+
+    auto final_type = result_type(queries, keys, values);
+    if (!issubdtype(final_type, floating)) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Received unsupported type "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    }
+
+    bool do_causal = (mask_mode == "causal");
+
+    auto q = astype(queries, final_type, s);
+    auto k = astype(keys, final_type, s);
+    auto v = astype(values, final_type, s);
+
+    auto stream = to_stream(s);
+
+    // Eagerly evaluate cu_seqlens and capture values for the fallback
+    // (the fallback may be called during gradient tracing when arrays
+    // are not evaluated)
+    eval({csq, csk});
+    int num_seqs = csq.shape(0) - 1;
+    std::vector<int32_t> csq_vec(
+        csq.data<int32_t>(), csq.data<int32_t>() + csq.shape(0));
+    std::vector<int32_t> csk_vec(
+        csk.data<int32_t>(), csk.data<int32_t>() + csk.shape(0));
+
+    // Fallback: split by cu_seqlens, run per-sequence standard SDPA
+    auto fallback = [scale,
+                     n_q_heads,
+                     n_kv_heads,
+                     do_causal,
+                     stream,
+                     num_seqs,
+                     csq_vec,
+                     csk_vec](const std::vector<array>& inputs) {
+      auto& q = inputs[0];
+      auto& k = inputs[1];
+      auto& v = inputs[2];
+
+      std::vector<array> outputs;
+      outputs.reserve(num_seqs);
+
+      for (int i = 0; i < num_seqs; i++) {
+        int q_start = csq_vec[i];
+        int q_end = csq_vec[i + 1];
+        int k_start = csk_vec[i];
+        int k_end = csk_vec[i + 1];
+        int seq_qL = q_end - q_start;
+        int seq_kL = k_end - k_start;
+
+        // Slice: q[q_start:q_end, :, :] -> (seq_qL, H, D) -> (1, H, seq_qL,
+        // D)
+        auto qi = slice(q, {q_start, 0, 0}, {q_end, n_q_heads, q.shape(2)});
+        qi = reshape(qi, {1, seq_qL, n_q_heads, qi.shape(2)});
+        qi = transpose(qi, {0, 2, 1, 3});
+
+        auto ki = slice(k, {k_start, 0, 0}, {k_end, n_kv_heads, k.shape(2)});
+        ki = reshape(ki, {1, seq_kL, n_kv_heads, ki.shape(2)});
+        ki = transpose(ki, {0, 2, 1, 3});
+
+        auto vi = slice(v, {k_start, 0, 0}, {k_end, n_kv_heads, v.shape(2)});
+        vi = reshape(vi, {1, seq_kL, n_kv_heads, vi.shape(2)});
+        vi = transpose(vi, {0, 2, 1, 3});
+
+        std::string mask_mode_i = do_causal ? "causal" : "";
+        auto oi = scaled_dot_product_attention(
+            qi, ki, vi, scale, mask_mode_i, {}, {}, {}, {}, stream);
+        // (1, H, seq_qL, D) -> (seq_qL, H, D)
+        oi = transpose(oi, {0, 2, 1, 3});
+        oi = reshape(oi, {seq_qL, n_q_heads, oi.shape(3)});
+        outputs.push_back(oi);
+      }
+
+      return std::vector<array>{concatenate(outputs, 0)};
+    };
+
+    std::vector<array> inputs = {q, k, v, csq, csk};
+
+    // For now, always use the primitive (which dispatches to kernel on GPU,
+    // fallback on CPU)
+    Shape out_shape{q.shape(0), n_q_heads, q.shape(2)};
+    auto primitive = std::make_shared<ScaledDotProductAttentionVarlen>(
+        stream, fallback, scale, do_causal);
+    return array(
+        std::move(out_shape), final_type, primitive, std::move(inputs));
+  }
+
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -920,6 +1083,13 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       static_cast<const ScaledDotProductAttentionVJP&>(other);
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_;
+}
+
+bool ScaledDotProductAttentionVarlen::is_equivalent(
+    const Primitive& other) const {
+  const ScaledDotProductAttentionVarlen& a_other =
+      static_cast<const ScaledDotProductAttentionVarlen&>(other);
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_;
 }
 
 bool Quantize::is_equivalent(const Primitive& other) const {

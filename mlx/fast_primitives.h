@@ -295,6 +295,38 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+class ScaledDotProductAttentionVarlen : public Custom {
+ public:
+  ScaledDotProductAttentionVarlen(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      bool do_causal)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        do_causal_(do_causal) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(ScaledDotProductAttentionVarlen);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, do_causal_);
+  }
+
+ private:
+  float scale_;
+  bool do_causal_;
+};
+
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)

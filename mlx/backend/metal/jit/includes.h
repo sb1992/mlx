@@ -45,6 +45,7 @@ const char* steel_conv_3d();
 const char* steel_conv_general();
 const char* gemv_masked();
 const char* steel_attention();
+const char* steel_attention_varlen();
 
 const char* gemm_nax();
 const char* steel_gemm_fused_nax();

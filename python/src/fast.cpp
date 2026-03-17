@@ -197,11 +197,16 @@ void init_fast(nb::module_& parent_module) {
          const float scale,
          const std::variant<std::monostate, std::string, mx::array>& mask,
          const std::optional<mx::array>& sinks,
+         const std::optional<mx::array>& cu_seqlens_q,
+         const std::optional<mx::array>& cu_seqlens_k,
          mx::StreamOrDevice s) {
         bool has_mask = !std::holds_alternative<std::monostate>(mask);
         bool has_str_mask =
             has_mask && std::holds_alternative<std::string>(mask);
         bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
+
+        std::string mask_mode = "";
+        std::optional<mx::array> mask_arr = std::nullopt;
 
         if (has_mask) {
           if (has_str_mask) {
@@ -212,18 +217,23 @@ void init_fast(nb::module_& parent_module) {
                   << mask_str << "'. Must be 'causal', or an array.";
               throw std::invalid_argument(msg.str());
             }
-            return mx::fast::scaled_dot_product_attention(
-                queries, keys, values, scale, mask_str, std::nullopt, sinks, s);
+            mask_mode = mask_str;
           } else {
-            auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries, keys, values, scale, "", mask_arr, sinks, s);
+            mask_arr = std::get<mx::array>(mask);
           }
-
-        } else {
-          return mx::fast::scaled_dot_product_attention(
-              queries, keys, values, scale, "", {}, sinks, s);
         }
+
+        return mx::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            mask_mode,
+            mask_arr,
+            sinks,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            s);
       },
       "q"_a,
       "k"_a,
@@ -232,9 +242,11 @@ void init_fast(nb::module_& parent_module) {
       "scale"_a,
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
+      "cu_seqlens_q"_a = nb::none(),
+      "cu_seqlens_k"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: Union[None, str, array] = None, sinks: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: Union[None, str, array] = None, sinks: Optional[array] = None, cu_seqlens_q: Optional[array] = None, cu_seqlens_k: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -260,6 +272,8 @@ void init_fast(nb::module_& parent_module) {
         * ``T_kv``: The number of keys and values per example.
         * ``D``: The per-head dimension.
 
+        Standard mode:
+
         Args:
             q (array): Queries with shape ``[B, N_q, T_q, D]``.
             k (array): Keys with shape ``[B, N_kv, T_kv, D]``.
@@ -276,6 +290,13 @@ void init_fast(nb::module_& parent_module) {
                last query aligns with the last key.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
+            cu_seqlens_q (array, optional): Cumulative sequence lengths for
+               queries, shape ``[num_sequences + 1]``, dtype ``int32``.
+               When provided, inputs are expected to be 3D packed tensors
+               with shape ``[total_tokens, N, D]``. Default: ``None``.
+            cu_seqlens_k (array, optional): Cumulative sequence lengths for
+               keys/values, shape ``[num_sequences + 1]``, dtype ``int32``.
+               Required when ``cu_seqlens_q`` is provided. Default: ``None``.
 
         Returns:
             array: The output array.

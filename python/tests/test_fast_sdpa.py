@@ -643,5 +643,531 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     self.assertTrue(mx.allclose(ref, out, **tolerance))
 
 
+def varlen_ref_attn(
+    q_packed, k_packed, v_packed, cu_seqlens_q, cu_seqlens_k, scale, do_causal=False
+):
+    """Reference implementation: split packed tensors by cu_seqlens, run standard SDPA on each."""
+    num_seqs = len(cu_seqlens_q) - 1
+    outputs = []
+    n_q_heads = q_packed.shape[1]
+    n_kv_heads = k_packed.shape[1]
+
+    for i in range(num_seqs):
+        q_s = cu_seqlens_q[i]
+        q_e = cu_seqlens_q[i + 1]
+        k_s = cu_seqlens_k[i]
+        k_e = cu_seqlens_k[i + 1]
+
+        # q_packed: (total_q, H, D) -> (seq_qL, H, D) -> (1, H, seq_qL, D)
+        qi = q_packed[q_s:q_e]  # (seq_qL, H, D)
+        qi = mx.expand_dims(qi, 0).transpose(0, 2, 1, 3)  # (1, H, seq_qL, D)
+        ki = k_packed[k_s:k_e]
+        ki = mx.expand_dims(ki, 0).transpose(0, 2, 1, 3)
+        vi = v_packed[k_s:k_e]
+        vi = mx.expand_dims(vi, 0).transpose(0, 2, 1, 3)
+
+        mask = "causal" if do_causal else None
+        oi = mlx_ref_attn(qi, ki, vi, scale=scale, mask=mask)
+        # (1, H, seq_qL, D) -> (seq_qL, H, D)
+        oi = oi.transpose(0, 2, 1, 3).squeeze(0)
+        outputs.append(oi)
+
+    return mx.concatenate(outputs, axis=0)
+
+
+class TestFastSDPAVarlen(mlx_tests.MLXTestCase):
+
+    def test_varlen_matches_individual(self):
+        """Pack 3 seqs, compare to individual SDPA."""
+        mx.random.seed(42)
+        seq_lens = [17, 32, 43]
+        dtypes = [mx.float16, mx.float32]
+        head_dims = [64, 80, 128]
+
+        for dtype in dtypes:
+            for D in head_dims:
+                with self.subTest(dtype=dtype, D=D):
+                    H = 8
+                    total_q = sum(seq_lens)
+                    cu_seqlens = mx.array(
+                        [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+                    )
+
+                    q = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                    k = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                    v = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                    scale = D**-0.5
+
+                    out = mx.fast.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        scale=scale,
+                        cu_seqlens_q=cu_seqlens,
+                        cu_seqlens_k=cu_seqlens,
+                    )
+                    ref = varlen_ref_attn(
+                        q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale
+                    )
+
+                    atol = 1e-2 if dtype == mx.float16 else 1e-4
+                    self.assertTrue(
+                        mx.allclose(out, ref, atol=atol, rtol=atol),
+                        f"Mismatch for dtype={dtype}, D={D}, max_diff={mx.max(mx.abs(out - ref)).item()}",
+                    )
+
+    def test_varlen_causal(self):
+        """Per-sequence causal masking."""
+        mx.random.seed(42)
+        seq_lens = [17, 32, 43]
+        D = 64
+        H = 8
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        for dtype in [mx.float16, mx.float32]:
+            with self.subTest(dtype=dtype):
+                q = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                k = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                v = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                scale = D**-0.5
+
+                out = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=scale,
+                    mask="causal",
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                )
+                ref = varlen_ref_attn(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens.tolist(),
+                    cu_seqlens.tolist(),
+                    scale,
+                    do_causal=True,
+                )
+
+                atol = 1e-2 if dtype == mx.float16 else 1e-4
+                self.assertTrue(
+                    mx.allclose(out, ref, atol=atol, rtol=atol),
+                    f"Mismatch for dtype={dtype}, max_diff={mx.max(mx.abs(out - ref)).item()}",
+                )
+
+    def test_varlen_no_causal(self):
+        """Bidirectional within each sequence."""
+        mx.random.seed(42)
+        seq_lens = [20, 30]
+        D = 64
+        H = 4
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        scale = D**-0.5
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        ref = varlen_ref_attn(q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale)
+
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+    def test_varlen_gqa(self):
+        """GQA: n_q_heads=16, n_kv_heads=4."""
+        mx.random.seed(42)
+        seq_lens = [20, 30]
+        D = 64
+        n_q_heads = 16
+        n_kv_heads = 4
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        q = mx.random.normal(shape=(total_q, n_q_heads, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, n_kv_heads, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, n_kv_heads, D)).astype(mx.float32)
+        scale = D**-0.5
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        ref = varlen_ref_attn(q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale)
+
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+    def test_varlen_single_sequence(self):
+        """cu_seqlens=[0, L] matches standard 4D SDPA."""
+        mx.random.seed(42)
+        L = 64
+        D = 64
+        H = 8
+        cu_seqlens = mx.array([0, L], dtype=mx.int32)
+
+        q = mx.random.normal(shape=(L, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(L, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(L, H, D)).astype(mx.float32)
+        scale = D**-0.5
+
+        out_varlen = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+
+        # Standard 4D path
+        q4d = q.reshape(1, L, H, D).transpose(0, 2, 1, 3)
+        k4d = k.reshape(1, L, H, D).transpose(0, 2, 1, 3)
+        v4d = v.reshape(1, L, H, D).transpose(0, 2, 1, 3)
+        out_4d = mx.fast.scaled_dot_product_attention(
+            q4d,
+            k4d,
+            v4d,
+            scale=scale,
+        )
+        out_4d = out_4d.transpose(0, 2, 1, 3).squeeze(0)
+
+        self.assertTrue(mx.allclose(out_varlen, out_4d, atol=1e-4, rtol=1e-4))
+
+    def test_varlen_single_token_sequences(self):
+        """Length-1 sequences in a pack."""
+        mx.random.seed(42)
+        num_seqs = 5
+        D = 64
+        H = 4
+        total_q = num_seqs
+        cu_seqlens = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        scale = D**-0.5
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        # For single-token sequences, output should just be v (softmax of single element = 1)
+        ref = varlen_ref_attn(q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale)
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+    def test_varlen_unaligned_lengths(self):
+        """Lengths NOT multiples of BQ=32/BK (primes: 17, 31, 43, 67)."""
+        mx.random.seed(42)
+        seq_lens = [17, 31, 43, 67]
+        D = 128
+        H = 8
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        for dtype in [mx.float16, mx.float32]:
+            with self.subTest(dtype=dtype):
+                q = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                k = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                v = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                scale = D**-0.5
+
+                out = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=scale,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                )
+                ref = varlen_ref_attn(
+                    q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale
+                )
+
+                atol = 1e-2 if dtype == mx.float16 else 1e-4
+                self.assertTrue(
+                    mx.allclose(out, ref, atol=atol, rtol=atol),
+                    f"Mismatch for dtype={dtype}, max_diff={mx.max(mx.abs(out - ref)).item()}",
+                )
+
+    def test_varlen_invalid_inputs(self):
+        """Error on wrong dtype, non-matching counts, 4D input."""
+        D = 64
+        H = 4
+        q = mx.random.normal(shape=(10, H, D))
+        k = mx.random.normal(shape=(10, H, D))
+        v = mx.random.normal(shape=(10, H, D))
+        scale = 1.0
+
+        # Wrong dtype for cu_seqlens
+        with self.assertRaises(ValueError):
+            mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                cu_seqlens_q=mx.array([0, 10], dtype=mx.float32),
+                cu_seqlens_k=mx.array([0, 10], dtype=mx.int32),
+            )
+
+        # Mismatched number of sequences
+        with self.assertRaises(ValueError):
+            mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                cu_seqlens_q=mx.array([0, 5, 10], dtype=mx.int32),
+                cu_seqlens_k=mx.array([0, 10], dtype=mx.int32),
+            )
+
+        # 4D input (should require 3D for varlen)
+        q4d = mx.random.normal(shape=(1, H, 10, D))
+        k4d = mx.random.normal(shape=(1, H, 10, D))
+        v4d = mx.random.normal(shape=(1, H, 10, D))
+        with self.assertRaises(ValueError):
+            mx.fast.scaled_dot_product_attention(
+                q4d,
+                k4d,
+                v4d,
+                scale=scale,
+                cu_seqlens_q=mx.array([0, 10], dtype=mx.int32),
+                cu_seqlens_k=mx.array([0, 10], dtype=mx.int32),
+            )
+
+        # cu_seqlens_q without cu_seqlens_k
+        with self.assertRaises(ValueError):
+            mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                cu_seqlens_q=mx.array([0, 10], dtype=mx.int32),
+            )
+
+        # Array mask not supported with cu_seqlens
+        with self.assertRaises(ValueError):
+            mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                mask=mx.ones((10, 10)),
+                cu_seqlens_q=mx.array([0, 10], dtype=mx.int32),
+                cu_seqlens_k=mx.array([0, 10], dtype=mx.int32),
+            )
+
+    def test_varlen_gradient(self):
+        """VJP through packed matches VJP through individual."""
+        mx.random.seed(42)
+        seq_lens = [16, 32]
+        D = 64
+        H = 4
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+        scale = D**-0.5
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+
+        def loss_varlen(q, k, v):
+            out = mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+            )
+            return out.sum()
+
+        def loss_ref(q, k, v):
+            out = varlen_ref_attn(
+                q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale
+            )
+            return out.sum()
+
+        g_varlen = mx.grad(loss_varlen)(q, k, v)
+        g_ref = mx.grad(loss_ref)(q, k, v)
+
+        self.assertTrue(
+            mx.allclose(g_varlen, g_ref, atol=1e-2, rtol=1e-2),
+            f"Gradient mismatch, max_diff={mx.max(mx.abs(g_varlen - g_ref)).item()}",
+        )
+
+    def test_varlen_stress_many_sequences(self):
+        """Stress test with 100+ length-1 sequences to exercise seq_block_map."""
+        mx.random.seed(42)
+        num_seqs = 128
+        D = 64
+        H = 4
+        total_q = num_seqs
+        cu_seqlens = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        scale = D**-0.5
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        ref = varlen_ref_attn(q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale)
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+        # Also test with mixed lengths (many short + a few long)
+        seq_lens = [1] * 50 + [32] * 10 + [64] * 5
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.float32)
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        ref = varlen_ref_attn(q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale)
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+    def test_varlen_bfloat16(self):
+        """Test bfloat16 dtype — kernel is instantiated, verify correctness."""
+        mx.random.seed(42)
+        seq_lens = [20, 32, 48]
+        D = 64
+        H = 8
+        total_q = sum(seq_lens)
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.bfloat16)
+        k = mx.random.normal(shape=(total_q, H, D)).astype(mx.bfloat16)
+        v = mx.random.normal(shape=(total_q, H, D)).astype(mx.bfloat16)
+        scale = D**-0.5
+
+        for mask in [None, "causal"]:
+            with self.subTest(mask=mask):
+                out = mx.fast.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=scale,
+                    mask=mask,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                )
+                ref = varlen_ref_attn(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens.tolist(),
+                    cu_seqlens.tolist(),
+                    scale,
+                    do_causal=(mask == "causal"),
+                )
+                self.assertTrue(
+                    mx.allclose(out, ref, atol=1e-2, rtol=1e-2),
+                    f"Mismatch for bf16 mask={mask}, max_diff={mx.max(mx.abs(out - ref)).item()}",
+                )
+
+    def test_varlen_large_total_tokens(self):
+        """Large total_tokens (16K+) for real-world LLM batch sizes."""
+        mx.random.seed(42)
+        # Simulate a realistic batch: 16 sequences of ~1024 tokens each
+        seq_lens = [
+            1024,
+            512,
+            768,
+            1280,
+            896,
+            1024,
+            640,
+            1024,
+            512,
+            1024,
+            768,
+            640,
+            1024,
+            896,
+            512,
+            1024,
+        ]
+        D = 128
+        H = 32
+        n_kv = 8
+        total_q = sum(seq_lens)  # ~13,548
+        cu_seqlens = mx.array(
+            [0] + [int(x) for x in np.cumsum(seq_lens)], dtype=mx.int32
+        )
+
+        q = mx.random.normal(shape=(total_q, H, D)).astype(mx.float16)
+        k = mx.random.normal(shape=(total_q, n_kv, D)).astype(mx.float16)
+        v = mx.random.normal(shape=(total_q, n_kv, D)).astype(mx.float16)
+        scale = D**-0.5
+
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            mask="causal",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+        )
+        # Just verify it doesn't crash and output has correct shape
+        self.assertEqual(out.shape, (total_q, H, D))
+        self.assertFalse(mx.any(mx.isnan(out)).item())
+
+        # Spot-check first sequence against reference
+        ref = varlen_ref_attn(
+            q, k, v, cu_seqlens.tolist(), cu_seqlens.tolist(), scale, do_causal=True
+        )
+        first_len = seq_lens[0]
+        self.assertTrue(
+            mx.allclose(out[:first_len], ref[:first_len], atol=1e-2, rtol=1e-2),
+            f"First seq mismatch, max_diff={mx.max(mx.abs(out[:first_len] - ref[:first_len])).item()}",
+        )
+
+
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner(failfast=True)

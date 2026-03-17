@@ -40,5 +40,21 @@ struct AttnMaskParams {
   int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
 };
 
+struct AttnVarlenParams {
+  int H; ///< Number of heads
+  int D; ///< Head dimension
+  int gqa_factor; ///< GQA factor
+  float scale; ///< Attention scale (pre-multiplied by M_LOG2E_F)
+  int max_seqlen_q; ///< Max individual Q sequence length
+  int max_seqlen_k; ///< Max individual K sequence length
+  int num_sequences; ///< Number of packed sequences
+  int total_q; ///< Sum of all Q lengths
+  int total_k; ///< Sum of all K lengths
+  int64_t Q_strides[2]; ///< [0]=head stride, [1]=token stride
+  int64_t K_strides[2];
+  int64_t V_strides[2];
+  int64_t O_strides[2];
+};
+
 } // namespace steel
 } // namespace mlx

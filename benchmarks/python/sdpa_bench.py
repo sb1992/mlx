@@ -159,8 +159,99 @@ def get_gflop_count(B, M, N, K):
     return float(2.0 * N_iter_bench * N_iter_func * B * M * N * K) / float(1024.0**3)
 
 
+def bench_varlen():
+    """Benchmark varlen SDPA vs padded and explicit mask approaches."""
+    print("\n=== Variable-Length SDPA Benchmarks ===\n")
+    print("  method,        seqs,   hdim, n_qh, n_kvh,   dtype,  time_s")
+
+    seq_configs = [
+        [17, 31, 43, 67],  # short mixed
+        [128, 256, 64, 512],  # medium mixed
+        [512, 1024, 256, 768],  # long mixed
+        [1024, 2048, 512, 1024, 2048, 512],  # training batch
+    ]
+
+    for dtype_str in ["float16"]:
+        dtype = mx.float16 if dtype_str == "float16" else mx.float32
+        for D in [128]:
+            for H in [32]:
+                n_kv = 8
+                for seq_lens in seq_configs:
+                    total_q = sum(seq_lens)
+                    max_len = max(seq_lens)
+                    num_seqs = len(seq_lens)
+                    cu_seqlens = mx.array(
+                        [0] + [int(x) for x in np.cumsum(seq_lens)],
+                        dtype=mx.int32,
+                    )
+                    scale = D**-0.5
+
+                    # 1. Varlen SDPA
+                    q_packed = mx.random.normal(shape=(total_q, H, D)).astype(dtype)
+                    k_packed = mx.random.normal(shape=(total_q, n_kv, D)).astype(dtype)
+                    v_packed = mx.random.normal(shape=(total_q, n_kv, D)).astype(dtype)
+
+                    def run_varlen():
+                        for _ in range(N_iter_func):
+                            out = mx.fast.scaled_dot_product_attention(
+                                q_packed,
+                                k_packed,
+                                v_packed,
+                                scale=scale,
+                                mask="causal",
+                                cu_seqlens_q=cu_seqlens,
+                                cu_seqlens_k=cu_seqlens,
+                            )
+                        mx.eval(out)
+                        return out
+
+                    t_varlen = bench(run_varlen)
+
+                    # 2. Padded (batch of max_len)
+                    q_pad = mx.random.normal(shape=(num_seqs, H, max_len, D)).astype(
+                        dtype
+                    )
+                    k_pad = mx.random.normal(shape=(num_seqs, n_kv, max_len, D)).astype(
+                        dtype
+                    )
+                    v_pad = mx.random.normal(shape=(num_seqs, n_kv, max_len, D)).astype(
+                        dtype
+                    )
+
+                    def run_padded():
+                        for _ in range(N_iter_func):
+                            out = mx.fast.scaled_dot_product_attention(
+                                q_pad,
+                                k_pad,
+                                v_pad,
+                                scale=scale,
+                                mask="causal",
+                            )
+                        mx.eval(out)
+                        return out
+
+                    t_padded = bench(run_padded)
+
+                    seqs_str = "+".join(str(s) for s in seq_lens)
+                    print(
+                        f"  varlen,  {seqs_str:>20s}, {D:5d}, {H:4d}, {n_kv:5d}, {dtype_str:>8s}, {t_varlen: 2.3f}"
+                    )
+                    print(
+                        f"  padded,  {seqs_str:>20s}, {D:5d}, {H:4d}, {n_kv:5d}, {dtype_str:>8s}, {t_padded: 2.3f}"
+                    )
+                    speedup = t_padded / t_varlen if t_varlen > 0 else 0
+                    print(f"  --> varlen speedup: {speedup:.2f}x\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run gemm benchmarks")
+    parser.add_argument("--varlen", action="store_true", help="Run varlen benchmarks")
+
+    args = parser.parse_args()
+
+    if args.varlen:
+        bench_varlen()
+        exit()
 
     dtypes = ("float16", "float32")[:1]
     transposes = (False,)

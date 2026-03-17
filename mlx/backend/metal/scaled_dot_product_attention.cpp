@@ -583,6 +583,133 @@ void sdpa_vector_2pass(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void sdpa_varlen_metal(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    const float scale,
+    array& o,
+    bool do_causal,
+    const array& cu_seqlens_q,
+    const array& cu_seqlens_k) {
+  using namespace mlx::steel;
+
+  int wm = 4;
+  int wn = 1;
+
+  int bd = q.shape(-1);
+  int bq = 32;
+  int bk = bd < 128 ? 32 : 16;
+
+  int H = q.shape(1);
+  int D = q.shape(2);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  // Read cu_seqlens on CPU
+  auto csq_ptr = cu_seqlens_q.data<int32_t>();
+  auto csk_ptr = cu_seqlens_k.data<int32_t>();
+  int num_seqs = cu_seqlens_q.shape(0) - 1;
+
+  // Precompute seq_block_map: for each query block, (seq_id, block_in_seq)
+  // Also compute max_seqlen_q and max_seqlen_k
+  int total_NQ_blocks = 0;
+  int max_seqlen_q = 0;
+  int max_seqlen_k = 0;
+
+  for (int i = 0; i < num_seqs; i++) {
+    int seq_qL = csq_ptr[i + 1] - csq_ptr[i];
+    int seq_kL = csk_ptr[i + 1] - csk_ptr[i];
+    max_seqlen_q = std::max(max_seqlen_q, seq_qL);
+    max_seqlen_k = std::max(max_seqlen_k, seq_kL);
+    total_NQ_blocks += (seq_qL + bq - 1) / bq;
+  }
+
+  // Build the map
+  std::vector<int32_t> map_data(total_NQ_blocks * 2);
+  int idx = 0;
+  for (int i = 0; i < num_seqs; i++) {
+    int seq_qL = csq_ptr[i + 1] - csq_ptr[i];
+    int seq_NQ = (seq_qL + bq - 1) / bq;
+    for (int b = 0; b < seq_NQ; b++) {
+      map_data[idx * 2] = i;
+      map_data[idx * 2 + 1] = b;
+      idx++;
+    }
+  }
+
+  // Upload seq_block_map as a temporary Metal buffer
+  array seq_block_map({total_NQ_blocks, 2}, int32, nullptr, {});
+  seq_block_map.set_data(allocator::malloc(seq_block_map.nbytes()));
+  std::memcpy(
+      seq_block_map.data<int32_t>(),
+      map_data.data(),
+      map_data.size() * sizeof(int32_t));
+  d.add_temporary(seq_block_map, s.index);
+
+  // Set function constant
+  const bool fc_do_causal = do_causal;
+  metal::MTLFCList func_consts = {
+      {&fc_do_causal, MTL::DataType::DataTypeBool, 301}};
+
+  std::string base_name;
+  concatenate(
+      base_name,
+      "attention_varlen_",
+      type_to_name(q),
+      "_bq",
+      bq,
+      "_bk",
+      bk,
+      "_bd",
+      bd,
+      "_wm",
+      wm,
+      "_wn",
+      wn);
+
+  std::string hash_name;
+  concatenate(hash_name, base_name, "_do_causal_", (fc_do_causal ? 't' : 'n'));
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+
+  auto kernel = get_steel_attention_varlen_kernel(
+      d, base_name, hash_name, func_consts, q, bq, bk, bd, wm, wn);
+
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Populate AttnVarlenParams
+  AttnVarlenParams params{
+      /* int H = */ H,
+      /* int D = */ D,
+      /* int gqa_factor = */ gqa_factor,
+      /* float scale = */ scale * static_cast<float>(M_LOG2E),
+      /* int max_seqlen_q = */ max_seqlen_q,
+      /* int max_seqlen_k = */ max_seqlen_k,
+      /* int num_sequences = */ num_seqs,
+      /* int total_q = */ q.shape(0),
+      /* int total_k = */ k.shape(0),
+      /* int64_t Q_strides[2] = */ {q.strides(1), q.strides(0)},
+      /* int64_t K_strides[2] = */ {k.strides(1), k.strides(0)},
+      /* int64_t V_strides[2] = */ {v.strides(1), v.strides(0)},
+      /* int64_t O_strides[2] = */ {o.strides(1), o.strides(0)}};
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(o, 3);
+  compute_encoder.set_bytes(params, 4);
+  compute_encoder.set_input_array(cu_seqlens_q, 5);
+  compute_encoder.set_input_array(cu_seqlens_k, 6);
+  compute_encoder.set_input_array(seq_block_map, 7);
+
+  MTL::Size grid_dims = MTL::Size(total_NQ_blocks, H, 1);
+  MTL::Size group_dims = MTL::Size(32, wm, wn);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 bool ScaledDotProductAttention::use_fallback(
@@ -793,6 +920,65 @@ void ScaledDotProductAttentionVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   throw std::runtime_error("NYI");
+}
+
+void ScaledDotProductAttentionVarlen::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_pre = inputs[1];
+  auto& v_pre = inputs[2];
+  auto& cu_seqlens_q = inputs[3];
+  auto& cu_seqlens_k = inputs[4];
+  auto& o = outputs[0];
+
+  // Check supported head dimensions
+  int D = q_pre.shape(-1);
+  if (D != 64 && D != 80 && D != 128) {
+    // Use fallback for unsupported head dims
+    outputs = fallback_(inputs);
+    return;
+  }
+
+  // Check device
+  if (s.device == Device::cpu) {
+    outputs = fallback_(inputs);
+    return;
+  }
+
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    } else {
+      return arr;
+    }
+  };
+
+  auto is_matrix_contiguous = [](const array& arr) {
+    return arr.strides(-1) == 1;
+  };
+
+  const auto& q = copy_unless(is_matrix_contiguous, q_pre);
+  const auto& k = copy_unless(is_matrix_contiguous, k_pre);
+  const auto& v = copy_unless(is_matrix_contiguous, v_pre);
+
+  // Set output strides: (total_q, H, D) with row-contiguous layout
+  // strides: D=1, H=D, token=H*D
+  o.set_data(allocator::malloc(o.nbytes()));
+
+  sdpa_varlen_metal(
+      s, d, q, k, v, scale_, o, do_causal_, cu_seqlens_q, cu_seqlens_k);
+
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 } // namespace mlx::core::fast
